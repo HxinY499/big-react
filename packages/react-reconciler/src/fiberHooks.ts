@@ -140,6 +140,7 @@ function updateWorkInProgressHook(): Hook {
     if (currentFiber !== null) {
       nextCurrentHook = currentFiber?.memorizedState;
     } else {
+      // mount 错误情况，mount不该进入这里
       nextCurrentHook = null;
     }
   } else {
@@ -147,7 +148,7 @@ function updateWorkInProgressHook(): Hook {
     nextCurrentHook = currentHook.next;
   }
 
-  if (nextCurrentHook === null) {
+  if (nextCurrentHook === null && currentHook !== null) {
     throw new Error(`组件${currentlyRenderingFiber?.type}本次执行时的Hook比上次执行的Hook多`);
   }
 

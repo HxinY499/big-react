@@ -2,7 +2,7 @@ import { appendInitialChild, Container, createInstance, createTextInstance } fro
 import { updateFiberProps } from 'react-dom/src/SyntheticEvent';
 import { FiberNode } from './fiber';
 import { NoFlags, Update } from './fiberFlags';
-import { FunctionComponent, HostComponent, HostRoot, HostText } from './workTags';
+import { Fragment, FunctionComponent, HostComponent, HostRoot, HostText } from './workTags';
 
 /*
 * -作用：
@@ -14,10 +14,10 @@ export const completeWork = (wip: FiberNode): FiberNode | null => {
   const current = wip.alternate;
   switch (wip.tag) {
     case HostRoot:
+    case FunctionComponent:
+    case Fragment:
       bubbleProperties(wip);
       return null;
-    case FunctionComponent:
-      bubbleProperties(wip);
       return null;
     case HostComponent:
       if (current !== null && wip.stateNode) {
