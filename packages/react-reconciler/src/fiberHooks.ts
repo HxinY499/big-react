@@ -1,7 +1,11 @@
 import { Dispatch } from 'react/src/currentDispatcher';
+import currentBatchConfig from 'react/src/currentBatchConfig';
 import internals from 'shared/internals';
 import { Action } from 'shared/ReactTypes';
 import { FiberNode } from './fiber';
+import { Flags, PassiveEffect } from './fiberFlags';
+import { Lane, NoLane, requestUpdateLane } from './fiberLanes';
+import { HookHasEffect, Passive } from './hookEffectTags';
 import {
   createUpdate,
   createUpdateQueue,
@@ -14,6 +18,7 @@ import { scheduleUpdateOnFiber } from './workLoop';
 let currentlyRenderingFiber: FiberNode | null = null;
 let workInProgressHook: Hook | null = null;
 let currentHook: Hook | null = null;
+let renderLane: Lane = NoLane;
 
 const { currentDispatcher } = internals;
 
@@ -23,10 +28,29 @@ interface Hook {
   next: Hook | null;
 }
 
-export function renderWithHooks(wip: FiberNode) {
+export interface Effect {
+  tag: Flags;
+  create: EffectCallback | void;
+  destroy: EffectCallback | void;
+  deps: EffectDeps;
+  next: Effect | null;
+}
+
+type EffectCallback = () => void;
+type EffectDeps = any[] | null;
+
+export interface FCUpdateQueue<State> extends UpdateQueue<State> {
+  lastEffect: Effect | null;
+}
+
+export function renderWithHooks(wip: FiberNode, lane: Lane) {
   currentlyRenderingFiber = wip;
-  // 重置，函数组件fiber中memorizedState指向hooks链表
+  // 重置，函数组件fiber.memorizedState = hooks链表
   wip.memorizedState = null;
+  // 重置，函数组件fiber.memorizedState = effect链表
+  wip.updateQueue = null;
+  wip.updateQueue = null;
+  renderLane = lane;
 
   const current = wip.alternate;
   if (current !== null) {
@@ -45,17 +69,25 @@ export function renderWithHooks(wip: FiberNode) {
   currentlyRenderingFiber = null;
   workInProgressHook = null;
   currentHook = null;
+  renderLane = NoLane;
   return children;
 }
 
 const HooksDispatcherOnMount = {
   useState: mountState,
+  useEffect: mountEffect,
+  useTransition: mountTransition,
+  useRef: mountRef,
 };
 const HooksDispatcherOnUpdate = {
   useState: updateState,
+  useEffect: updateEffect,
+  useTransition: updateTransition,
+  useRef: updateRef,
 };
 
-function mountState<State>(initialState: (() => State) | State): [State, Dispatch<State>] {
+// ///////////////useState起////////////////////////////////////////////////////////////////////////////////
+function mountState<State>(initialState?: (() => State) | State): [State, Dispatch<State>] {
   // 找到当前useState对应的hook数据
   const hook = mountWorkInProgressHook();
 
@@ -69,24 +101,26 @@ function mountState<State>(initialState: (() => State) | State): [State, Dispatc
   const queue = createUpdateQueue<State>();
   hook.updateQueue = queue;
   hook.memorizedState = memorizedState;
+  hook.baseState = memorizedState;
 
   // @ts-ignore
   const dispatch = dispatchSetState.bind(null, currentlyRenderingFiber, queue);
   queue.dispatch = dispatch;
 
-  return [memorizedState, dispatch];
+  return [memorizedState!, dispatch];
 }
 
-function updateState<State>(initialState: (() => State) | State): [State, Dispatch<State>] {
+function updateState<State>(initialState?: (() => State) | State): [State, Dispatch<State>] {
   // 找到当前useState对应的hook数据
   const hook = updateWorkInProgressHook();
 
   // 计算新state的逻辑
   const queue = hook.updateQueue as UpdateQueue<State>;
   const pending = queue.shared.pending;
+  queue.shared.pending = null;
 
   if (pending !== null) {
-    const { memorizedState } = processUpdateQueue(hook.memorizedState, pending);
+    const { memorizedState } = processUpdateQueue(hook.memorizedState, pending, renderLane);
     hook.memorizedState = memorizedState;
   }
 
@@ -98,9 +132,129 @@ function dispatchSetState<State>(
   updateQueue: UpdateQueue<State>,
   action: Action<State>
 ) {
-  const update = createUpdate(action);
+  const lane = requestUpdateLane();
+  const update = createUpdate(action, lane);
   enqueueUpdate(updateQueue, update);
-  scheduleUpdateOnFiber(fiber);
+  scheduleUpdateOnFiber(fiber, lane);
+}
+// ///////////////useState终////////////////////////////////////////////////////////////////////////////////
+
+// ///////////////useEffect起///////////////////////////////////////////////////////////////////////////////
+function mountEffect(create: EffectCallback, deps: EffectDeps) {
+  // 找到当前useEffect对应的hook数据
+  const hook = mountWorkInProgressHook();
+  const nextDeps = deps === undefined ? null : deps;
+  currentlyRenderingFiber!.flags |= PassiveEffect;
+
+  // useEffect的memorizedState存着该fiberNode中所有的useEffect组成的环状链表
+  hook.memorizedState = pushEffect(Passive | HookHasEffect, create, undefined, nextDeps);
+}
+
+function updateEffect(create: EffectCallback, deps: EffectDeps) {
+  // 找到当前useEffect对应的hook数据
+  const hook = updateWorkInProgressHook();
+  const nextDeps = deps === undefined ? null : deps;
+  let destroy: EffectCallback | void;
+
+  if (currentHook !== null) {
+    const prevEffect = currentHook.memorizedState as Effect;
+    destroy = prevEffect.destroy;
+
+    if (nextDeps !== null) {
+      // 浅比较
+      const prevDeps = prevEffect.deps;
+      if (areHookInputsEqual(nextDeps, prevDeps)) {
+        hook.memorizedState = pushEffect(Passive, create, destroy, nextDeps);
+        return;
+      }
+    }
+    // 浅比较不相等
+    currentlyRenderingFiber!.flags |= PassiveEffect;
+    hook.memorizedState = pushEffect(Passive | HookHasEffect, create, destroy, nextDeps);
+  }
+  currentlyRenderingFiber!.flags |= PassiveEffect;
+}
+
+function pushEffect(
+  hookFlags: Flags,
+  create: EffectCallback | void,
+  destroy: EffectCallback | void,
+  deps: EffectDeps
+): Effect {
+  const effect: Effect = {
+    tag: hookFlags,
+    create,
+    destroy,
+    deps,
+    next: null,
+  };
+  const fiber = currentlyRenderingFiber as FiberNode;
+  const updateQueue = fiber.updateQueue as FCUpdateQueue<any>;
+  if (updateQueue === null) {
+    fiber.updateQueue = createFCUpdateQueue();
+    effect.next = effect;
+    (fiber.updateQueue as FCUpdateQueue<any>).lastEffect = effect;
+  } else {
+    // 插入effect
+    const lastEffect = updateQueue.lastEffect;
+    if (lastEffect === null) {
+      effect.next = effect;
+      updateQueue.lastEffect = effect;
+    } else {
+      const firstEffect = lastEffect.next;
+      lastEffect.next = effect;
+      effect.next = firstEffect;
+      updateQueue.lastEffect = effect;
+    }
+  }
+  return effect;
+}
+// ///////////////useEffect终///////////////////////////////////////////////////////////////////////////////
+
+// ///////////////useTransition起///////////////////////////////////////////////////////////////////////////
+function mountTransition(): [boolean, (callback: () => void) => void] {
+  const [isPending, setIsPending] = mountState(false);
+  const hook = mountWorkInProgressHook();
+  const start = startTransition.bind(null, setIsPending);
+  hook.memorizedState = start;
+  return [isPending, start];
+}
+function updateTransition(): [boolean, (callback: () => void) => void] {
+  const [isPending] = updateState();
+  const hook = updateWorkInProgressHook();
+  const start = hook.memorizedState;
+  currentBatchConfig;
+  return [isPending as boolean, start];
+}
+
+function startTransition(setPending: Dispatch<boolean>, callback: () => void) {
+  setPending(true);
+  const prevTransition = currentBatchConfig.transition;
+  currentBatchConfig.transition = 1;
+
+  callback();
+  setPending(false);
+
+  currentBatchConfig.transition = prevTransition;
+}
+// ///////////////useTransition终///////////////////////////////////////////////////////////////////////////
+
+// ///////////////useRef起///////////////////////////////////////////////////////////////////////////
+function mountRef<T>(initialValue: T): { current: T } {
+  const hook = mountWorkInProgressHook();
+  const ref = { current: initialValue };
+  hook.memorizedState = ref;
+  return ref;
+}
+function updateRef<T>(initialValue: T): { current: T } {
+  const hook = updateWorkInProgressHook();
+  return hook.memorizedState;
+}
+// ///////////////useRef终///////////////////////////////////////////////////////////////////////////
+function createFCUpdateQueue<State>() {
+  const updateQueue = createUpdateQueue<State>() as FCUpdateQueue<State>;
+  updateQueue.lastEffect = null;
+  return updateQueue;
 }
 
 function mountWorkInProgressHook(): Hook {
@@ -173,4 +327,18 @@ function updateWorkInProgressHook(): Hook {
     workInProgressHook = newHook;
   }
   return workInProgressHook;
+}
+
+function areHookInputsEqual(nextDeps: EffectDeps, prevDeps: EffectDeps) {
+  if (nextDeps === null || prevDeps === null) {
+    return false;
+  }
+  for (let i = 0; i < prevDeps.length && i < nextDeps.length; i++) {
+    if (Object.is(nextDeps[i], prevDeps[i])) {
+      continue;
+    }
+    return false;
+  }
+
+  return true;
 }

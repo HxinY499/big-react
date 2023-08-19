@@ -2,6 +2,9 @@ import { Props, Key, Ref, ReactElementType } from 'shared/ReactTypes';
 import { FunctionComponent, HostComponent, WorkTag, Fragment } from './workTags';
 import { Flags, NoFlags } from './fiberFlags';
 import { Container } from 'hostConfig';
+import { Lane, Lanes, NoLane, NoLanes } from './fiberLanes';
+import { Effect } from './fiberHooks';
+import { CallbackNode } from 'scheduler';
 
 export class FiberNode {
   tag: WorkTag;
@@ -60,15 +63,36 @@ export class FiberNode {
   }
 }
 
+export interface PendingPassiveEffects {
+  unmount: Effect[];
+  update: Effect[];
+}
+
 export class FiberRootNode {
   container: Container;
   current: FiberNode;
   finishedWork: FiberNode | null;
+  pendingLanes: Lanes;
+  finishedLane: Lane;
+  pendingPassiveEffects: PendingPassiveEffects;
+
+  callbackNode: CallbackNode | null;
+  callbackPriority: Lane;
+
   constructor(container: Container, hostRootFiber: FiberNode) {
     this.container = container;
     this.current = hostRootFiber;
     hostRootFiber.stateNode = this;
     this.finishedWork = null;
+    this.pendingLanes = NoLanes;
+    this.finishedLane = NoLane;
+    this.pendingPassiveEffects = {
+      unmount: [],
+      update: [],
+    };
+
+    this.callbackNode = null;
+    this.callbackPriority = NoLane;
   }
 }
 
@@ -99,7 +123,7 @@ export function createWorkInProgress(current: FiberNode, pendingProps: Props): F
 }
 
 export function createFiberFromElement(element: ReactElementType) {
-  const { type, key, props } = element;
+  const { type, key, props, ref } = element;
   let fiberTag: WorkTag = FunctionComponent;
 
   if (typeof type === 'string') {
@@ -109,6 +133,7 @@ export function createFiberFromElement(element: ReactElementType) {
   }
   const fiber = new FiberNode(fiberTag, props, key);
   fiber.type = type;
+  fiber.ref = ref;
   return fiber;
 }
 
